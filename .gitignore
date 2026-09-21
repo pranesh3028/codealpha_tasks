@@ -1,0 +1,5 @@
+out/
+data/
+.claude/
+.vscode/
+*.class

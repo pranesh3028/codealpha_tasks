@@ -1,0 +1,321 @@
+package web;
+
+import com.sun.net.httpserver.*;
+import java.io.*;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import service.*;
+import model.*;
+import persistence.*;
+
+public class Router {
+    private final AuthService authService;
+    private final MarketService marketService;
+    private final TradingService tradingService;
+    private final PortfolioService portfolioService;
+    private final SessionManager sessionManager;
+    private final DataRepository repository;
+    private final Map<String, User> users;
+
+    public Router(AuthService authService, MarketService marketService, TradingService tradingService, PortfolioService portfolioService, SessionManager sessionManager, DataRepository repository, Map<String, User> users) {
+        this.authService = authService;
+        this.marketService = marketService;
+        this.tradingService = tradingService;
+        this.portfolioService = portfolioService;
+        this.sessionManager = sessionManager;
+        this.repository = repository;
+        this.users = users;
+    }
+
+    public void route(HttpExchange exchange) throws IOException {
+        String path = exchange.getRequestURI().getPath();
+        String method = exchange.getRequestMethod();
+        String sessionId = getSessionId(exchange);
+        String username = sessionManager.getUsername(sessionId);
+
+        System.out.println("Request: " + method + " " + path + " (User: " + (username != null ? username : "Guest") + ")");
+
+        try {
+            if ("/register".equals(path)) {
+                handleRegister(exchange, method);
+            } else if ("/login".equals(path)) {
+                handleLogin(exchange, method);
+            } else if ("/logout".equals(path)) {
+                handleLogout(exchange, sessionId);
+            } else if ("/market".equals(path)) {
+                if (username == null) { redirect(exchange, "/login"); return; }
+                handleMarket(exchange);
+            } else if ("/stock".equals(path)) {
+                if (username == null) { redirect(exchange, "/login"); return; }
+                handleStockDetail(exchange);
+            } else if ("/trade".equals(path)) {
+                if (username == null) { redirect(exchange, "/login"); return; }
+                handleTrade(exchange, method, username);
+            } else if ("/portfolio".equals(path)) {
+                if (username == null) { redirect(exchange, "/login"); return; }
+                handlePortfolio(exchange, username);
+            } else if ("/history".equals(path)) {
+                if (username == null) { redirect(exchange, "/login"); return; }
+                handleHistory(exchange, username);
+            } else if ("/leaderboard".equals(path)) {
+                if (username == null) { redirect(exchange, "/login"); return; }
+                handleLeaderboard(exchange);
+            } else {
+                redirect(exchange, "/market");
+            }
+        } catch (Exception e) {
+            System.err.println("Error handling request " + path + ": " + e.getMessage());
+            e.printStackTrace();
+            sendError(exchange, 500, "Internal Server Error: " + e.getMessage());
+        }
+    }
+
+    private String getSessionId(HttpExchange exchange) {
+        String cookieHeader = exchange.getRequestHeaders().getFirst("Cookie");
+        if (cookieHeader == null) return null;
+        for (String cookie : cookieHeader.split(";")) {
+            String[] pair = cookie.trim().split("=");
+            if (pair.length == 2 && "sessionid".equals(pair[0])) return pair[1];
+        }
+        return null;
+    }
+
+    private void redirect(HttpExchange exchange, String path) throws IOException {
+        exchange.getResponseHeaders().set("Location", path);
+        exchange.sendResponseHeaders(302, -1);
+        exchange.close();
+    }
+
+    private void sendError(HttpExchange exchange, int code, String message) throws IOException {
+        String response = HtmlRenderer.layout("Error", "<h1>Error " + code + "</h1><p>" + HtmlRenderer.escape(message) + "</p><a href=\"/login\">Back to Login</a>", null);
+        sendResponse(exchange, code, response);
+    }
+
+    private void handleRegister(HttpExchange exchange, String method) throws IOException {
+        if ("GET".equals(method)) {
+            String content = """
+                <div class=\"card\">
+                    <h2>Register</h2>
+                    <form method=\"POST\">
+                        <div style=\"margin-bottom: 10px\">Username: <br><input type=\"text\" name=\"username\" required style=\"width: 100%%; padding: 8px\"></div>
+                        <div style=\"margin-bottom: 10px\">Password: <br><input type=\"password\" name=\"password\" required style=\"width: 100%%; padding: 8px\"></div>
+                        <button type=\"submit\" class=\"btn btn-primary\">Register</button>
+                    </form>
+                    <p>Already have an account? <a href=\"/login\">Login here</a></p>
+                </div>
+                """;
+            sendResponse(exchange, 200, HtmlRenderer.layout("Register", content, null));
+        } else if ("POST".equals(method)) {
+            Map<String, String> params = HtmlRenderer.parseFormData(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            String user = params.get("username");
+            String pass = params.get("password");
+            try {
+                authService.register(user, pass);
+                redirect(exchange, "/login?msg=Registered+successfully");
+            } catch (Exception e) {
+                sendResponse(exchange, 200, HtmlRenderer.layout("Register", "<h1>Error</h1><p>" + HtmlRenderer.escape(e.getMessage()) + "</p><a href=\"/register\">Try again</a>", "Error: " + e.getMessage()));
+            }
+        }
+    }
+
+    private void handleLogin(HttpExchange exchange, String method) throws IOException {
+        if ("GET".equals(method)) {
+            String content = """
+                <div class=\"card\">
+                    <h2>Login</h2>
+                    <form method=\"POST\">
+                        <div style=\"margin-bottom: 10px\">Username: <br><input type=\"text\" name=\"username\" required style=\"width: 100%%; padding: 8px\"></div>
+                        <div style=\"margin-bottom: 10px\">Password: <br><input type=\"password\" name=\"password\" required style=\"width: 100%%; padding: 8px\"></div>
+                        <button type=\"submit\" class=\"btn btn-primary\">Login</button>
+                    </form>
+                    <p>Don't have an account? <a href=\"/register\">Register here</a></p>
+                </div>
+                """;
+            sendResponse(exchange, 200, HtmlRenderer.layout("Login", content, null));
+        } else if ("POST".equals(method)) {
+            Map<String, String> params = HtmlRenderer.parseFormData(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            String user = params.get("username");
+            String pass = params.get("password");
+            try {
+                User u = authService.login(user, pass);
+                String sid = sessionManager.createSession(u.getUsername());
+                exchange.getResponseHeaders().add("Set-Cookie", "sessionid=" + sid + "; HttpOnly; Path=/");
+                redirect(exchange, "/market");
+            } catch (Exception e) {
+                sendResponse(exchange, 200, HtmlRenderer.layout("Login", "<h1>Error</h1><p>" + HtmlRenderer.escape(e.getMessage()) + "</p><a href=\"/login\">Try again</a>", "Error: " + e.getMessage()));
+            }
+        }
+    }
+
+    private void handleLogout(HttpExchange exchange, String sessionId) throws IOException {
+        if (sessionId != null) sessionManager.removeSession(sessionId);
+        exchange.getResponseHeaders().add("Set-Cookie", "sessionid=; Max-Age=0; Path=/");
+        redirect(exchange, "/login");
+    }
+
+    private void handleMarket(HttpExchange exchange) throws IOException {
+        StringBuilder content = new StringBuilder("<div class=\"card\"><h2>Market</h2>");
+        content.append("<meta http-equiv=\"refresh\" content=\"3\">");
+        content.append("<table><thead><tr><th>Symbol</th><th>Company</th><th>Sector</th><th>Price</th><th>Change</th><th>%</th><th>Chart</th></tr></thead><tbody>");
+
+        for (Stock s : marketService.getAllStocks()) {
+            double price = s.getCurrentPrice();
+            List<Double> history = s.getPriceHistory();
+            double prev = history.size() > 1 ? history.get(history.size() - 2) : price;
+            double diff = price - prev;
+            double pct = (diff / prev) * 100;
+            String colorClass = diff >= 0 ? "up" : "down";
+            String sign = diff >= 0 ? "+" : "";
+
+            content.append("<tr>")
+                    .append("<td><b>").append(s.getSymbol()).append("</b></td>")
+                    .append("<td>").append(s.getCompanyName()).append("</td>")
+                    .append("<td>").append(s.getSector()).append("</td>")
+                    .append("<td>$").append(String.format("%.2f", price)).append("</td>")
+                    .append("<td class=\"").append(colorClass).append("\">").append(sign).append(String.format("%.2f", diff)).append("</td>")
+                    .append("<td class=\"").append(colorClass).append("\">").append(sign).append(String.format("%.2f", pct)).append("%%</td>")
+                    .append("<td>").append(SvgChartBuilder.buildSparkline(history)).append("</td>")
+                    .append("</tr>");
+        }
+        content.append("</tbody></table></div>");
+        sendResponse(exchange, 200, HtmlRenderer.layout("Market", content.toString(), null));
+    }
+
+    private void handleStockDetail(HttpExchange exchange) throws IOException {
+        Map<String, String> params = HtmlRenderer.parseFormData(exchange.getRequestURI().getQuery());
+        String symbol = params.get("symbol");
+        if (symbol == null) { sendError(exchange, 400, "Missing symbol parameter"); return; }
+
+        Stock stock = marketService.getStock(symbol);
+        if (stock == null) { sendError(exchange, 404, "Stock not found"); return; }
+
+        List<Double> history = stock.getPriceHistory();
+        StringBuilder content = new StringBuilder("<div class=\"card\">");
+        content.append("<h2>").append(stock.getCompanyName()).append(" (").append(stock.getSymbol()).append(")</h2>");
+        content.append("<p>Sector: ").append(stock.getSector()).append("</p>");
+        content.append("<p>Current Price: <b>$").append(String.format("%.2f", stock.getCurrentPrice())).append("</b></p>");
+        content.append("<div style=\"margin: 20px 0\">").append(SvgChartBuilder.buildPerformanceChart(history)).append("</div>");
+
+        content.append("<h3>Trade</h3>");
+        content.append("<form action=\"/trade\" method=\"POST\">");
+        content.append("<input type=\"hidden\" name=\"symbol\" value=\"").append(symbol).append("\">");
+        content.append("<div style=\"margin-bottom: 10px\">Quantity: <br><input type=\"number\" name=\"quantity\" required style=\"width: 100px; padding: 5px\"></div>");
+        content.append("<button type=\"submit\" name=\"action\" value=\"buy\" class=\"btn btn-success\">Buy</button>");
+        content.append("<button type=\"submit\" name=\"action\" value=\"sell\" class=\"btn btn-danger\">Sell</button>");
+        content.append("</form></div>");
+
+        sendResponse(exchange, 200, HtmlRenderer.layout("Stock Detail", content.toString(), null));
+    }
+
+    private void handleTrade(HttpExchange exchange, String method, String username) throws IOException {
+        if ("POST".equals(method)) {
+            Map<String, String> params = HtmlRenderer.parseFormData(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            String symbol = params.get("symbol");
+            String action = params.get("action");
+            String qtyStr = params.get("quantity");
+
+            try {
+                int qty = Integer.parseInt(qtyStr);
+                if ("buy".equals(action)) {
+                    tradingService.buyStock(username, symbol, qty);
+                } else if ("sell".equals(action)) {
+                    tradingService.sellStock(username, symbol, qty);
+                } else {
+                    throw new Exception("Invalid action");
+                }
+                redirect(exchange, "/portfolio?msg=Trade+successful");
+            } catch (Exception e) {
+                sendResponse(exchange, 200, HtmlRenderer.layout("Trade", "<h1>Trade Failed</h1><p>" + HtmlRenderer.escape(e.getMessage()) + "</p><a href=\"/market\">Back to Market</a>", "Error: " + e.getMessage()));
+            }
+        } else {
+            redirect(exchange, "/market");
+        }
+    }
+
+    private void handlePortfolio(HttpExchange exchange, String username) throws IOException {
+        User user = users.get(username);
+        if (user == null) { sendError(exchange, 404, "User not found"); return; }
+
+        double totalValue = portfolioService.calculateTotalValue(username);
+        Map<String, Map<String, Holding>> allHoldings = repository.loadHoldings();
+        Map<String, Holding> userHoldings = allHoldings.getOrDefault(username, new HashMap<>());
+
+        StringBuilder content = new StringBuilder("<div class=\"card\"><h2>Your Portfolio</h2>");
+        content.append("<p>Cash Balance: <b>$").append(String.format("%.2f", user.getBalance())).append("</p>");
+        content.append("<p>Total Portfolio Value: <b>$").append(String.format("%.2f", totalValue)).append("</p>");
+
+        List<PortfolioSnapshot> snapshots = portfolioService.getSnapshots(username);
+        List<Double> values = snapshots.stream().map(PortfolioSnapshot::getTotalValue).collect(java.util.stream.Collectors.toList());
+        content.append("<div style=\"margin: 20px 0\">").append(SvgChartBuilder.buildPerformanceChart(values)).append("</div>");
+
+        content.append("<h3>Holdings</h3><table><thead><tr><th>Symbol</th><th>Qty</th><th>Avg Cost</th><th>Current Price</th><th>Market Value</th><th>P/L</th></tr></thead><tbody>");
+
+        for (Holding h : userHoldings.values()) {
+            Stock s = marketService.getStock(h.getSymbol());
+            double currentPrice = s != null ? s.getCurrentPrice() : 0;
+            double marketValue = h.getQuantity() * currentPrice;
+            double pl = marketValue - (h.getQuantity() * h.getAverageCost());
+            String colorClass = pl >= 0 ? "up" : "down";
+
+            content.append("<tr>")
+                    .append("<td>").append(h.getSymbol()).append("</td>")
+                    .append("<td>").append(h.getQuantity()).append("</td>")
+                    .append("<td>$").append(String.format("%.2f", h.getAverageCost())).append("</td>")
+                    .append("<td>$").append(String.format("%.2f", currentPrice)).append("</td>")
+                    .append("<td>$").append(String.format("%.2f", marketValue)).append("</td>")
+                    .append("<td class=\"").append(colorClass).append("\">").append(String.format("%.2f", pl)).append("</td>")
+                    .append("</tr>");
+        }
+        content.append("</tbody></table></div>");
+        sendResponse(exchange, 200, HtmlRenderer.layout("Portfolio", content.toString(), null));
+    }
+
+    private void handleHistory(HttpExchange exchange, String username) throws IOException {
+        List<Transaction> allTx = repository.loadTransactions();
+        List<Transaction> userTx = allTx.stream().filter(t -> t.getUsername().equals(username)).collect(java.util.stream.Collectors.toList());
+
+        StringBuilder content = new StringBuilder("<div class=\"card\"><h2>Transaction History</h2>");
+        content.append("<table><thead><tr><th>Time</th><th>Type</th><th>Symbol</th><th>Qty</th><th>Price</th><th>Total</th><th>P/L</th></tr></thead><tbody>");
+
+        for (Transaction t : userTx) {
+            content.append("<tr>")
+                    .append("<td>").append(t.getTimestamp()).append("</td>")
+                    .append("<td>").append(t.getType()).append("</td>")
+                    .append("<td>").append(t.getSymbol()).append("</td>")
+                    .append("<td>").append(t.getQuantity()).append("</td>")
+                    .append("<td>$").append(String.format("%.2f", t.getPrice())).append("</td>")
+                    .append("<td>$").append(String.format("%.2f", t.getTotal())).append("</td>")
+                    .append("<td>$").append(String.format("%.2f", t.getRealizedPL())).append("</td>")
+                    .append("</tr>");
+        }
+        content.append("</tbody></table></div>");
+        sendResponse(exchange, 200, HtmlRenderer.layout("History", content.toString(), null));
+    }
+
+    private void handleLeaderboard(HttpExchange exchange) throws IOException {
+        List<Map.Entry<String, Double>> leaders = portfolioService.getLeaderboard();
+        StringBuilder content = new StringBuilder("<div class=\"card\"><h2>Leaderboard</h2><table><thead><tr><th>Rank</th><th>User</th><th>Total Value</th></tr></thead><tbody>");
+        int rank = 1;
+        for (Map.Entry<String, Double> leadersEntry : leaders) {
+            content.append("<tr>")
+                    .append("<td>").append(rank++).append("</td>")
+                    .append("<td>").append(leadersEntry.getKey()).append("</td>")
+                    .append("<td>$").append(String.format("%.2f", leadersEntry.getValue())).append("</td>")
+                    .append("</tr>");
+        }
+        content.append("</tbody></table></div>");
+        sendResponse(exchange, 200, HtmlRenderer.layout("Leaderboard", content.toString(), null));
+    }
+
+    private void sendResponse(HttpExchange exchange, int code, String response) throws IOException {
+        if (response == null) response = "";
+        byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
+        exchange.sendResponseHeaders(code, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
+            os.flush();
+        }
+    }
+}
